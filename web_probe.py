@@ -41,7 +41,12 @@ def gmail_page(browser):
 def open_compose(page, subject, body):
     page.goto('https://mail.google.com/mail/u/0/?view=cm&fs=1'
               f'&to={quote(RECEIVER)}&su={quote(subject)}&body={quote(body)}')
-    page.wait_for_function(f"document.title.includes('{SENDER}')", timeout=30000)
+    # Gmail 啟用 Trusted Types，wait_for_function 的字串 eval 會被擋，改在 Python 端輪詢標題
+    deadline = time.time() + 30
+    while SENDER not in page.title():
+        if time.time() > deadline:
+            raise TimeoutError(f"30 秒內標題沒出現 {SENDER}：確認專用 Chrome 已登入寄件帳號")
+        time.sleep(0.2)
     box = page.locator('div[role="textbox"][contenteditable="true"]').first
     box.wait_for(timeout=30000)
     box.click()
