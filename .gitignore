@@ -1,0 +1,18 @@
+# OAuth 憑證與權杖（絕不可提交）
+credentials.json
+client_secret*.json
+token*.json
+clientid.txt
+
+# 個人帳號設定
+accounts.json
+
+# 量測資料與匯出的信件
+web_probe_results.csv
+*.eml
+
+# Python / 環境
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

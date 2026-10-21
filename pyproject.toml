@@ -1,0 +1,13 @@
+[project]
+name = "precise-email-delivery"
+version = "0.1.0"
+description = "在指定的標準時間，透過 Gmail API 或 Gmail 網頁版精準寄出信件，並量測送達延遲"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "google-api-python-client>=2.200.0",
+    "google-auth>=2.58.0",
+    "google-auth-httplib2>=0.4.2",
+    "google-auth-oauthlib>=1.4.1",
+    "playwright>=1.64.0",
+]
