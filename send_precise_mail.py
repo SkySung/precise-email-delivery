@@ -14,11 +14,21 @@ from common import (READ_SCOPES, SEND_SCOPES, build_gmail_like_raw,
                     consensus_offset_ms, load_accounts, load_service)
 
 TZ = ZoneInfo('Asia/Taipei')
+# 只有在終端機前執行時才顯示會原地更新的倒數列，導到檔案時不輸出
+LIVE = sys.stdout.isatty()
+# Ctrl+C 時用來判斷信寄出了沒：before（尚未呼叫 send）→ sending → sent
+STATE = {'phase': 'before'}
 
 
 def log(msg, offset_ms=0.0):
     now = datetime.fromtimestamp(time.time() + offset_ms / 1000.0, TZ)
-    print(f"[標準 {now.strftime('%H:%M:%S.%f')[:-3]}] {msg}", flush=True)
+    clear = '\r\033[K' if LIVE else ''
+    print(f"{clear}[標準 {now.strftime('%H:%M:%S.%f')[:-3]}] {msg}", flush=True)
+
+
+def show_status(text):
+    if LIVE:
+        print(f"\r\033[K{text}", end='', flush=True)
 
 
 def fmt(epoch):
@@ -29,14 +39,19 @@ def true_now(offset_ms):
     return time.time() + offset_ms / 1000.0
 
 
-def sleep_until_true(target_true, offset_ms):
+def sleep_until_true(target_true, offset_ms, status=None):
     # 粗等待用牆上時鐘（Mac 睡眠時仍會前進），每秒檢查一次
     while (rem := target_true - true_now(offset_ms)) > 0:
+        if status:
+            show_status(status())
         time.sleep(min(rem, 1.0))
 
 
-def spin_until_mono(target_mono):
+def spin_until_mono(target_mono, status=None):
     while (rem := target_mono - time.monotonic()) > 0:
+        # 最後 1 秒不更新畫面，讓發射點附近只剩等待
+        if status and rem > 1.0:
+            show_status(status())
         if rem > 0.05:
             time.sleep(min(rem - 0.05, 0.5))
 
@@ -108,9 +123,22 @@ def main():
     # 每個 API 請求最多等 8 秒，避免網路卡住時無限等待
     sender = load_service('token_sender.json', SEND_SCOPES, timeout=8)
     raw = build_gmail_like_raw(to, subject, body)
+    log("✅ 已收到確認，授權與信件內容都沒問題，開始倒數。"
+        "發射前按 Ctrl+C 可安全取消（不會寄出）", offset_ms)
+
+    spinner = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+
+    def countdown(next_step):
+        def text():
+            now = true_now(offset_ms)
+            rem = max(0, int(t0 - now))
+            dot = spinner[int(now * 2) % len(spinner)]
+            return (f"{dot} 運作中  現在 {fmt(now)[11:19]}  距離 T0 還有 {rem // 60:02d}:{rem % 60:02d}"
+                    f"  下一步：{next_step}")
+        return text
 
     # T-90s：刷新 access token，避免發送當下觸發 refresh；失敗只警告（啟動時載入的 token 仍有效 1 小時）
-    sleep_until_true(t0 - 90, offset_ms)
+    sleep_until_true(t0 - 90, offset_ms, countdown('T-90s 刷新 token'))
     creds = sender._http.credentials
     try:
         base_req = Request()
@@ -121,7 +149,7 @@ def main():
         log(f"[警告] Token 刷新失敗（{e}），沿用目前 token（有效至 {creds.expiry} UTC）", offset_ms)
 
     # T-45s：重新交叉校時，之後全程改用 monotonic，不受系統時鐘跳動影響
-    sleep_until_true(t0 - 45, offset_ms)
+    sleep_until_true(t0 - 45, offset_ms, countdown('T-45s 最終校時'))
     try:
         offset_ms, detail = consensus_offset_ms()
         extra_s = 0.0
@@ -132,7 +160,7 @@ def main():
     fire_mono = mono_for_true(fire_true + extra_s, offset_ms)
 
     # T-10s：預熱 TLS 連線並記下 historyId（失敗時用來即時判斷是否已寄出，避免重複寄信）
-    spin_until_mono(fire_mono - 10.0)
+    spin_until_mono(fire_mono - 10.0, countdown('T-10s 預熱連線'))
     start_hid = None
     for _ in range(2):
         t = time.monotonic()
@@ -171,7 +199,8 @@ def main():
                 return True
         return False
 
-    spin_until_mono(fire_mono)
+    spin_until_mono(fire_mono, countdown('T0 發射'))
+    STATE['phase'] = 'sending'
     t_fire_mono = time.monotonic()
     # 以 monotonic 換算，系統時鐘若在倒數期間跳動，紀錄仍正確
     t_fire_true = fire_true + extra_s + (t_fire_mono - fire_mono)
@@ -193,6 +222,7 @@ def main():
         log(f"確認寄件備份沒有這封信，立即第 {attempt + 1} 次重試", offset_ms)
     else:
         sys.exit("❗ 連續 5 次發送失敗且確認未寄出，請立刻用 Gmail 手動寄出。")
+    STATE['phase'] = 'sent'
     rtt = (time.monotonic() - t_fire_mono) * 1000
 
     log(f"已送出 msg {msg_id}，發射於 {fmt(t_fire_true)}，從發射到完成 {rtt:.0f} ms", offset_ms)
@@ -234,4 +264,14 @@ def verify(sender, msg_id, rehearse, verdict):
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # caffeinate 以 -w 監看本程式，程式結束它就跟著結束，不會殘留
+        print('\r\033[K' if LIVE else '', end='')
+        sys.exit({
+            'before': "\n已按 Ctrl+C 中止：信尚未送出。要寄的話重新執行一次即可。",
+            'sending': "\n❗ 在發送途中按下 Ctrl+C：信可能已經送出。"
+                       "請先打開寄件備份確認，有這封信就不要再寄；沒有才重新執行。",
+            'sent': "\n已按 Ctrl+C 中止：信已經送出（只是沒跑完事後驗證），不要再寄。",
+        }[STATE['phase']])
