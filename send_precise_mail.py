@@ -173,7 +173,8 @@ def main():
 
     spin_until_mono(fire_mono)
     t_fire_mono = time.monotonic()
-    t_fire_true = true_now(offset_ms)
+    # 以 monotonic 換算，系統時鐘若在倒數期間跳動，紀錄仍正確
+    t_fire_true = fire_true + extra_s + (t_fire_mono - fire_mono)
     msg_id = None
     for attempt in range(1, 6):
         try:
