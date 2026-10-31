@@ -69,13 +69,21 @@ def wait_arrival(receiver, subject, timeout=150):
     return None
 
 
-def probe(rounds, gap):
+def probe(rounds, gap, lead=None):
     receiver = load_service('token_receiver.json', READ_SCOPES)
     offset_ms, _ = consensus_offset_ms()
     last_sync = time.monotonic()
     print(f"本機偏差 {offset_ms:+.1f} ms")
     with sync_playwright() as pw:
-        browser = pw.chromium.connect_over_cdp(CDP_URL)
+        # 視窗開關中時 CDP 偶爾回 "Browser context management is not supported"，重試幾次
+        for attempt in range(3):
+            try:
+                browser = pw.chromium.connect_over_cdp(CDP_URL)
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(3)
         page = gmail_page(browser)
         for i in range(1, rounds + 1):
             if time.monotonic() - last_sync > 120:
@@ -84,7 +92,14 @@ def probe(rounds, gap):
             subject = f"WEBPROBE {uuid.uuid4().hex[:10]}"
             open_compose(page, subject, f"web probe {i}")
 
-            fire_true = math.ceil(true_now(offset_ms)) + 2 + random.random()
+            if lead is None:
+                fire_true = math.ceil(true_now(offset_ms)) + 2 + random.random()
+            else:
+                # 在下一個整分鐘前 lead 秒按下，讓信大約在整分鐘抵達
+                fire_true = math.ceil(true_now(offset_ms) / 60) * 60 - lead
+                if fire_true - true_now(offset_ms) < 1:
+                    print(f"[{i:02d}] 距離按下點不到 1 秒，略過")
+                    continue
             spin_until_mono(mono_for_true(fire_true, offset_ms))
             t_before = true_now(offset_ms)
             page.keyboard.press('Meta+Enter')
@@ -145,9 +160,10 @@ def main():
     ap = argparse.ArgumentParser(description='自動在 Gmail 網頁版按下寄出，量測 按下→Date 與 按下→進 B 信箱 的延遲')
     ap.add_argument('-n', '--rounds', type=int, default=10)
     ap.add_argument('--gap', type=float, default=30.0, help='每輪間隔秒數')
+    ap.add_argument('--lead', type=float, help='在下一個整分鐘前幾秒按下（不給則隨機秒數）')
     ap.add_argument('--report', action='store_true', help='只讀 CSV 印統計')
     args = ap.parse_args()
-    report() if args.report else probe(args.rounds, args.gap)
+    report() if args.report else probe(args.rounds, args.gap, args.lead)
 
 
 if __name__ == '__main__':
