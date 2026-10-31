@@ -16,3 +16,6 @@ web_probe_results.csv
 __pycache__/
 *.pyc
 .DS_Store
+
+# 正式信件內文（含個資）
+body.txt

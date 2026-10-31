@@ -61,16 +61,26 @@ def main():
     subprocess.Popen(['caffeinate', '-dimsu', '-w', str(os.getpid())])
 
     log("交叉校時中…")
-    offset_ms, detail = consensus_offset_ms()
-    log(f"本機偏差 {offset_ms:+.1f} ms（標準 - 本機）  " +
-        ", ".join(f"{k}={v:+.0f}" for k, v in detail.items()), offset_ms)
+    # 校時失敗時不中止：改用系統時鐘並多延後 1 秒（寧可晚到，不可早到、不可沒寄）
+    extra_s = 0.0
+    try:
+        offset_ms, detail = consensus_offset_ms()
+        log(f"本機偏差 {offset_ms:+.1f} ms（標準 - 本機）  " +
+            ", ".join(f"{k}={v:+.0f}" for k, v in detail.items()), offset_ms)
+    except RuntimeError as e:
+        offset_ms, extra_s = 0.0, 1.0
+        log(f"[警告] 校時失敗（{e}），暫用系統時鐘並多延後 1 秒；T-45s 會再試一次")
 
     if args.rehearse:
         start = datetime.fromtimestamp(true_now(offset_ms) + 90, TZ)
         target_dt = (start + timedelta(minutes=1)).replace(second=0, microsecond=0)
         to = load_accounts()['receiver']
-        subject = f"REHEARSAL {target_dt.strftime('%H:%M:%S')}"
-        body = f"rehearsal for {target_dt.isoformat()}"
+        tag = f"REHEARSAL {target_dt.strftime('%H:%M:%S')}"
+        subject = f"[{tag}] {args.subject}" if args.subject else tag
+        body = (Path(args.body_file).read_text(encoding='utf-8') if args.body_file
+                else f"rehearsal for {target_dt.isoformat()}")
+        if args.to:
+            log(f"[演練] 忽略 --to {args.to}，一律寄給測試收件帳號 {to}")
     else:
         if not (args.at and args.to and args.subject and args.body_file):
             ap.error('正式模式需要 --at --to --subject --body-file（或用 --rehearse 演練）')
@@ -95,59 +105,114 @@ def main():
         if input("確認無誤請輸入 yes：").strip() != 'yes':
             sys.exit("已取消。")
 
-    sender = load_service('token_sender.json', SEND_SCOPES)
+    # 每個 API 請求最多等 8 秒，避免網路卡住時無限等待
+    sender = load_service('token_sender.json', SEND_SCOPES, timeout=8)
     raw = build_gmail_like_raw(to, subject, body)
 
-    # T-90s：強制刷新 access token，避免發送當下觸發 refresh
+    # T-90s：刷新 access token，避免發送當下觸發 refresh；失敗只警告（啟動時載入的 token 仍有效 1 小時）
     sleep_until_true(t0 - 90, offset_ms)
     creds = sender._http.credentials
-    creds.refresh(Request())
-    Path(__file__).with_name('token_sender.json').write_text(creds.to_json())
-    log(f"Token 已刷新，有效至 {creds.expiry} UTC", offset_ms)
+    try:
+        base_req = Request()
+        creds.refresh(lambda *a, **k: base_req(*a, **{**k, 'timeout': 15}))
+        Path(__file__).with_name('token_sender.json').write_text(creds.to_json())
+        log(f"Token 已刷新，有效至 {creds.expiry} UTC", offset_ms)
+    except Exception as e:
+        log(f"[警告] Token 刷新失敗（{e}），沿用目前 token（有效至 {creds.expiry} UTC）", offset_ms)
 
     # T-45s：重新交叉校時，之後全程改用 monotonic，不受系統時鐘跳動影響
     sleep_until_true(t0 - 45, offset_ms)
     try:
         offset_ms, detail = consensus_offset_ms()
-        fire_mono = mono_for_true(fire_true, offset_ms)
+        extra_s = 0.0
         log(f"最終校時 {offset_ms:+.1f} ms，鎖定 monotonic 發射點", offset_ms)
     except RuntimeError as e:
-        fire_mono = mono_for_true(fire_true + 0.2, offset_ms)
-        log(f"[警告] 最終校時失敗（{e}），沿用先前偏差並多延後 200 ms", offset_ms)
+        extra_s = max(extra_s, 0.2)
+        log(f"[警告] 最終校時失敗（{e}），沿用先前偏差並多延後 {extra_s * 1000:.0f} ms", offset_ms)
+    fire_mono = mono_for_true(fire_true + extra_s, offset_ms)
 
-    # T-5s：預熱 TLS 連線
-    spin_until_mono(fire_mono - 5.0)
-    t = time.monotonic()
-    sender.users().getProfile(userId='me').execute()
-    log(f"TLS 預熱完成（{(time.monotonic() - t) * 1000:.0f} ms）", offset_ms)
+    # T-10s：預熱 TLS 連線並記下 historyId（失敗時用來即時判斷是否已寄出，避免重複寄信）
+    spin_until_mono(fire_mono - 10.0)
+    start_hid = None
+    for _ in range(2):
+        t = time.monotonic()
+        try:
+            start_hid = sender.users().getProfile(userId='me').execute()['historyId']
+            log(f"TLS 預熱完成（{(time.monotonic() - t) * 1000:.0f} ms）", offset_ms)
+            break
+        except Exception as e:
+            log(f"[警告] 預熱失敗（{e}）", offset_ms)
+
+    def sent_since_start():
+        """回傳 T0 後寄件備份新增的訊息 id；無法確認時丟例外"""
+        if start_hid:
+            resp = sender.users().history().list(userId='me', startHistoryId=start_hid,
+                                                 historyTypes=['messageAdded'], labelId='SENT').execute()
+            ids = [a['message']['id'] for h in resp.get('history', []) for a in h.get('messagesAdded', [])]
+        else:
+            ids = [m['id'] for m in sender.users().messages().list(
+                userId='me', q=f'in:sent to:{to} after:{int(t0) - 60}').execute().get('messages', [])]
+        return ids[0] if ids else None
+
+    def confirm_not_sent():
+        """連續兩次確認寄件備份沒有新信才回傳 True；確認到已寄出回傳 msg id；無法確認回傳 False"""
+        clean = 0
+        for _ in range(10):
+            time.sleep(3 if start_hid else 10)
+            try:
+                found = sent_since_start()
+            except Exception as e:
+                log(f"[警告] 無法查詢寄件備份（{e}）", offset_ms)
+                continue
+            if found:
+                return found
+            clean += 1
+            if clean >= 2:
+                return True
+        return False
 
     spin_until_mono(fire_mono)
     t_fire_mono = time.monotonic()
     t_fire_true = true_now(offset_ms)
-    try:
-        res = sender.users().messages().send(userId='me', body=raw).execute()
-    except Exception as e:
-        log(f"[錯誤] 發送失敗：{e}", offset_ms)
-        hits = sender.users().messages().list(
-            userId='me', q=f'in:sent to:{to} after:{int(t0) - 60}').execute().get('messages', [])
-        if hits:
-            sys.exit("寄件備份已有這封信，判定已送出，不重試。")
-        log("寄件備份沒有這封信，立即重試一次", offset_ms)
-        res = sender.users().messages().send(userId='me', body=raw).execute()
+    msg_id = None
+    for attempt in range(1, 6):
+        try:
+            msg_id = sender.users().messages().send(userId='me', body=raw).execute()['id']
+            break
+        except Exception as e:
+            log(f"[錯誤] 第 {attempt} 次發送失敗：{e}", offset_ms)
+        state = confirm_not_sent()
+        if isinstance(state, str):
+            msg_id = state
+            log(f"寄件備份已有新信 {msg_id}，判定剛才其實已送出，不重試", offset_ms)
+            break
+        if state is False:
+            sys.exit("❗ 無法確認信是否已寄出。為避免重複寄信，腳本停止重試。"
+                     "請立刻打開寄件備份確認：沒有這封信才手動補寄。")
+        log(f"確認寄件備份沒有這封信，立即第 {attempt + 1} 次重試", offset_ms)
+    else:
+        sys.exit("❗ 連續 5 次發送失敗且確認未寄出，請立刻用 Gmail 手動寄出。")
     rtt = (time.monotonic() - t_fire_mono) * 1000
 
-    log(f"已送出 msg {res['id']}，發射於 {fmt(t_fire_true)}，API RTT {rtt:.0f} ms", offset_ms)
+    log(f"已送出 msg {msg_id}，發射於 {fmt(t_fire_true)}，從發射到完成 {rtt:.0f} ms", offset_ms)
 
     def verdict(epoch):
         diff = int(epoch) - int(t0)
         return '✅ 同一秒' if diff == 0 else ('❌ 早到！' if diff < 0 else f'⚠️ 晚 {diff} 秒')
 
+    try:
+        verify(sender, msg_id, args.rehearse, verdict)
+    except Exception as e:
+        log(f"[提示] 信已送出，但事後驗證失敗（{e}），請到寄件備份確認", offset_ms)
+
+
+def verify(sender, msg_id, rehearse, verdict):
     sent = sender.users().messages().get(
-        userId='me', id=res['id'], format='metadata', metadataHeaders=['Message-ID']).execute()
+        userId='me', id=msg_id, format='metadata', metadataHeaders=['Message-ID']).execute()
     a_stamp = int(sent['internalDate']) / 1000.0
     print(f"\nA 寄件備份 internalDate = {fmt(a_stamp)}  {verdict(a_stamp)}")
 
-    if args.rehearse:
+    if rehearse:
         msgid = sent['payload']['headers'][0]['value']
         receiver = load_service('token_receiver.json', READ_SCOPES)
         for _ in range(60):

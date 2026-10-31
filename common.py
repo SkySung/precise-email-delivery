@@ -10,9 +10,11 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
+import httplib2
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,7 +35,7 @@ READ_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 _NTP_EPOCH_DELTA = 2208988800
 
 
-def load_service(token_file, scopes):
+def load_service(token_file, scopes, timeout=None):
     path = BASE_DIR / token_file
     if not path.exists():
         raise SystemExit(f"找不到 {token_file}，請先執行對應的授權腳本。")
@@ -46,7 +48,8 @@ def load_service(token_file, scopes):
                 f"{token_file} 的 refresh token 已失效（Testing 模式 7 天過期）：{e}\n請重新授權。"
             )
         path.write_text(creds.to_json())
-    return build('gmail', 'v1', credentials=creds, cache_discovery=False)
+    http = AuthorizedHttp(creds, http=httplib2.Http(timeout=timeout))
+    return build('gmail', 'v1', http=http, cache_discovery=False)
 
 
 def build_raw(to, subject, body):
@@ -73,8 +76,9 @@ def build_gmail_like_raw(to, subject, text):
 TIME_SERVERS = ['time.google.com', 'time1.google.com', 'time.stdtime.gov.tw', 'time.cloudflare.com']
 
 
-def consensus_offset_ms(max_spread_ms=50.0):
-    """多台伺服器交叉校時，回傳 (中位數 offset_ms, {server: offset_ms})；不一致或不足 2 台時丟 RuntimeError"""
+def consensus_offset_ms(max_dev_ms=50.0):
+    """多台伺服器交叉校時，排除偏離中位數超過 max_dev_ms 的伺服器後取中位數；
+    回傳 (offset_ms, {server: offset_ms})；剩不到 2 台時丟 RuntimeError"""
     results = {}
     for server in TIME_SERVERS:
         r = sntp_offset_ms(server, samples=5)
@@ -82,10 +86,11 @@ def consensus_offset_ms(max_spread_ms=50.0):
             results[server] = r[0]
     if len(results) < 2:
         raise RuntimeError(f"可用時間伺服器不足 2 台：{results}")
-    vals = sorted(results.values())
-    if vals[-1] - vals[0] > max_spread_ms:
-        raise RuntimeError(f"時間伺服器彼此不一致（差 {vals[-1] - vals[0]:.0f} ms）：{results}")
-    return statistics.median(vals), results
+    mid = statistics.median(results.values())
+    kept = [v for v in results.values() if abs(v - mid) <= max_dev_ms]
+    if len(kept) < 2:
+        raise RuntimeError(f"時間伺服器彼此不一致：{results}")
+    return statistics.median(kept), results
 
 
 def sntp_offset_ms(server='time.google.com', samples=7):
